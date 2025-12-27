@@ -1,2 +1,5 @@
 /KT/dist
 /KT/build
+/KT/build_venv
+/KT/dist_small
+/KT/upx
