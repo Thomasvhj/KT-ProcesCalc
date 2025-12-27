@@ -11,19 +11,22 @@ Interactive visual editor for creating chemical process flow networks.
 
 import tkinter as tk
 from tkinter import ttk, messagebox, simpledialog
-import numpy as np
 from dataclasses import dataclass, field
 from typing import Dict, List, Tuple, Optional, Set
-from enum import Enum
 import json
+import math
 
+# Import network data structures
+from chemical_flow_network import ProcessType, Component
 
-class ProcessType(Enum):
-    INPUT = "input"
-    OUTPUT = "output"
-    REACTOR = "reactor"
-    MIXER = "mixer"          # Multiple inputs → one output (combines flows)
-    SEPARATOR = "separator"  # One input → multiple outputs (splits flow by beta)
+# Import calculation functions
+from calculations import (
+    solve_network as calc_solve_network,
+    validate_separator_betas,
+    find_reference_reactant,
+    calculate_stoichiometric_input_ratios,
+    reverse_solve as calc_reverse_solve,
+)
 
 
 # Colors for different process types
@@ -37,14 +40,8 @@ PROCESS_COLORS = {
 
 
 @dataclass
-class Component:
-    """Chemical component/species"""
-    id: str
-    name: str
-
-
-@dataclass
 class Process:
+    """GUI Process with position data (extends network Process with GUI fields)"""
     id: str
     name: str
     process_type: ProcessType
@@ -52,24 +49,19 @@ class Process:
     y: int
     width: int = 100
     height: int = 60
-    # Stoichiometric coefficients for reactors: component_id -> coefficient
-    # Negative = reactant (consumed), Positive = product (produced)
-    # e.g., {"A": -2, "B": -1, "C": 1, "D": 3} for 2A + B -> C + 3D
     stoich: Dict[str, float] = field(default_factory=dict)
-    # Conversion (alpha): fraction of limiting reactant converted (0-1)
-    # extent = conversion * (limiting reactant input / |stoich coeff|)
     conversion: float = 0.0
-    # Beta per tube per component (for separators)
     beta_components: Dict[str, Dict[str, float]] = field(default_factory=dict)
 
 
 @dataclass
 class Tube:
+    """GUI Tube with moles storage"""
     id: str
     from_process: str
     to_process: str
-    beta: float = 1.0  # Split fraction (only used when alpha_eff = 0)
-    moles: Dict[str, float] = field(default_factory=dict)  # Component -> moles
+    beta: float = 1.0
+    moles: Dict[str, float] = field(default_factory=dict)
     
     def total_moles(self) -> float:
         return sum(self.moles.values())
@@ -86,10 +78,12 @@ class FlowNetworkGUI:
         self.processes: Dict[str, Process] = {}
         self.tubes: Dict[str, Tube] = {}
         self.input_moles: Dict[str, Dict[str, float]] = {}  # process_id -> comp_id -> moles
+        self.output_moles: Dict[str, Dict[str, float]] = {}  # For reverse calc: process_id -> comp_id -> target moles
         self.alpha_eff: float = 0.0  # Overall process efficiency (0 = disabled)
         
         # GUI state
         self.selected_process = None
+        self.selected_processes: Set[str] = set()  # Multiple selection
         self.drawing_tube = False
         self.tube_start_process = None
         self.process_counter = 0
@@ -99,6 +93,15 @@ class FlowNetworkGUI:
         # Undo history
         self.undo_stack = []
         self.max_undo = 50
+        
+        # Grid settings
+        self.snap_to_grid = tk.BooleanVar(value=False)
+        self.grid_size = 20  # Grid spacing in pixels
+        
+        # Zoom settings
+        self.zoom_level = 1.0
+        self.min_zoom = 0.25
+        self.max_zoom = 3.0
         
         self.setup_gui()
         
@@ -113,60 +116,77 @@ class FlowNetworkGUI:
         self.main_paned.pack(fill=tk.BOTH, expand=True)
         
         # Left panel - Tools (collapsible)
-        self.left_panel = ttk.Frame(self.main_paned, width=180)
+        self.left_panel = ttk.Frame(self.main_paned, width=160)
         self.left_panel_content = ttk.Frame(self.left_panel)
-        self.left_panel_content.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
+        self.left_panel_content.pack(fill=tk.BOTH, expand=True, padx=3, pady=3)
         
         # Process buttons
-        ttk.Label(self.left_panel_content, text="Add Process:", font=('Arial', 10, 'bold')).pack(pady=5)
-        
+        ttk.Label(self.left_panel_content, text="Add Process:", font=('Arial', 9, 'bold')).pack(anchor='w')
         for ptype in ProcessType:
             btn = ttk.Button(self.left_panel_content, text=ptype.value.capitalize(),
                            command=lambda t=ptype: self.add_process_mode(t))
-            btn.pack(fill=tk.X, pady=2)
-        
-        ttk.Separator(self.left_panel_content, orient=tk.HORIZONTAL).pack(fill=tk.X, pady=10)
+            btn.pack(fill=tk.X, pady=1)
         
         # Tube button
-        ttk.Label(self.left_panel_content, text="Connections:", font=('Arial', 10, 'bold')).pack(pady=5)
-        self.tube_btn = ttk.Button(self.left_panel_content, text="Draw Tube (Arrow)",
+        self.tube_btn = ttk.Button(self.left_panel_content, text="Draw Tube",
                                    command=self.toggle_tube_mode)
         self.tube_btn.pack(fill=tk.X, pady=2)
         
-        ttk.Separator(self.left_panel_content, orient=tk.HORIZONTAL).pack(fill=tk.X, pady=10)
+        ttk.Separator(self.left_panel_content, orient=tk.HORIZONTAL).pack(fill=tk.X, pady=5)
         
-        # Actions
-        ttk.Label(self.left_panel_content, text="Actions:", font=('Arial', 10, 'bold')).pack(pady=5)
-        ttk.Button(self.left_panel_content, text="Manage Components", 
-                  command=self.manage_components).pack(fill=tk.X, pady=2)
-        ttk.Button(self.left_panel_content, text="Set α_eff (Overall)", 
-                  command=self.set_alpha_eff).pack(fill=tk.X, pady=2)
-        ttk.Button(self.left_panel_content, text="Solve Network", 
-                  command=self.solve_network).pack(fill=tk.X, pady=2)
+        # Main actions
+        ttk.Button(self.left_panel_content, text="Components", 
+                  command=self.manage_components).pack(fill=tk.X, pady=1)
+        ttk.Button(self.left_panel_content, text="Set α_eff", 
+                  command=self.set_alpha_eff).pack(fill=tk.X, pady=1)
+        
+        # Solve buttons in a row
+        solve_frame = ttk.Frame(self.left_panel_content)
+        solve_frame.pack(fill=tk.X, pady=2)
+        ttk.Button(solve_frame, text="Solve", width=7,
+                  command=self.solve_network).pack(side=tk.LEFT, expand=True, fill=tk.X, padx=(0,1))
+        ttk.Button(solve_frame, text="Reverse", width=7,
+                  command=self.reverse_solve).pack(side=tk.LEFT, expand=True, fill=tk.X, padx=(1,0))
+        
+        ttk.Separator(self.left_panel_content, orient=tk.HORIZONTAL).pack(fill=tk.X, pady=5)
+        
+        # File operations in rows
+        file_frame1 = ttk.Frame(self.left_panel_content)
+        file_frame1.pack(fill=tk.X, pady=1)
+        ttk.Button(file_frame1, text="Save", width=7,
+                  command=self.save_network).pack(side=tk.LEFT, expand=True, fill=tk.X, padx=(0,1))
+        ttk.Button(file_frame1, text="Load", width=7,
+                  command=self.load_network).pack(side=tk.LEFT, expand=True, fill=tk.X, padx=(1,0))
+        
+        file_frame2 = ttk.Frame(self.left_panel_content)
+        file_frame2.pack(fill=tk.X, pady=1)
+        ttk.Button(file_frame2, text="Example", width=7,
+                  command=self.load_example).pack(side=tk.LEFT, expand=True, fill=tk.X, padx=(0,1))
+        ttk.Button(file_frame2, text="Export", width=7,
+                  command=self.export_results_csv).pack(side=tk.LEFT, expand=True, fill=tk.X, padx=(1,0))
+        
+        ttk.Separator(self.left_panel_content, orient=tk.HORIZONTAL).pack(fill=tk.X, pady=5)
+        
+        # Options & extras
+        ttk.Checkbutton(self.left_panel_content, text="Snap to Grid", 
+                       variable=self.snap_to_grid,
+                       command=self.redraw).pack(anchor='w')
+        
+        # Equations dropdown menu
+        extras_frame = ttk.Frame(self.left_panel_content)
+        extras_frame.pack(fill=tk.X, pady=2)
+        ttk.Button(extras_frame, text="Equations ▼", 
+                  command=self.show_equations_menu).pack(fill=tk.X)
+        
         ttk.Button(self.left_panel_content, text="Clear All", 
                   command=self.clear_all).pack(fill=tk.X, pady=2)
-        ttk.Button(self.left_panel_content, text="Show Equations", 
-                  command=self.show_equations).pack(fill=tk.X, pady=2)
-        ttk.Button(self.left_panel_content, text="Show Symbolic Eq.", 
-                  command=self.show_symbolic_equations).pack(fill=tk.X, pady=2)
         
-        ttk.Separator(self.left_panel_content, orient=tk.HORIZONTAL).pack(fill=tk.X, pady=10)
-        
-        # File operations
-        ttk.Label(self.left_panel_content, text="File:", font=('Arial', 10, 'bold')).pack(pady=5)
-        ttk.Button(self.left_panel_content, text="Save Network", 
-                  command=self.save_network).pack(fill=tk.X, pady=2)
-        ttk.Button(self.left_panel_content, text="Load Network", 
-                  command=self.load_network).pack(fill=tk.X, pady=2)
-        ttk.Button(self.left_panel_content, text="Load Example", 
-                  command=self.load_example).pack(fill=tk.X, pady=2)
-        
-        self.main_paned.add(self.left_panel, minsize=20, width=180)
+        self.main_paned.add(self.left_panel, minsize=20, width=160)
         
         # Canvas for drawing (center) with toggle buttons
         canvas_frame = ttk.Frame(self.main_paned)
         
-        # Top bar with toggle buttons
+        # Top bar with toggle buttons and zoom controls
         canvas_top_bar = ttk.Frame(canvas_frame)
         canvas_top_bar.pack(fill=tk.X)
         
@@ -175,6 +195,16 @@ class FlowNetworkGUI:
         self.toggle_left_btn = ttk.Button(canvas_top_bar, text="◀ Tools", width=10,
                                           command=self.toggle_left_panel)
         self.toggle_left_btn.pack(side=tk.LEFT, padx=2, pady=2)
+        
+        # Zoom controls (center)
+        zoom_frame = ttk.Frame(canvas_top_bar)
+        zoom_frame.pack(side=tk.LEFT, expand=True)
+        
+        ttk.Button(zoom_frame, text="−", width=3, command=self.zoom_out).pack(side=tk.LEFT, padx=2)
+        self.zoom_label = ttk.Label(zoom_frame, text="100%", width=6)
+        self.zoom_label.pack(side=tk.LEFT, padx=2)
+        ttk.Button(zoom_frame, text="+", width=3, command=self.zoom_in).pack(side=tk.LEFT, padx=2)
+        ttk.Button(zoom_frame, text="Reset", width=5, command=self.zoom_reset).pack(side=tk.LEFT, padx=2)
         
         # Right panel toggle button
         self.right_visible = True
@@ -190,10 +220,18 @@ class FlowNetworkGUI:
         self.canvas.bind('<Button-3>', self.on_right_click)
         self.canvas.bind('<B1-Motion>', self.on_drag)
         self.canvas.bind('<ButtonRelease-1>', self.on_release)
+        self.canvas.bind('<Motion>', self.on_mouse_move)
+        self.canvas.bind('<MouseWheel>', self.on_mouse_wheel)  # Zoom with mouse wheel
         
-        # Bind Ctrl+Z for undo
+        # Tooltip for hover info
+        self.tooltip = None
+        self.tooltip_id = None
+        
+        # Bind Ctrl+Z for undo, Delete for delete selection
         self.root.bind('<Control-z>', self.undo)
         self.root.bind('<Control-Z>', self.undo)
+        self.root.bind('<Delete>', self.delete_selection)
+        self.root.bind('<BackSpace>', self.delete_selection)
         
         self.main_paned.add(canvas_frame, minsize=200)
         
@@ -205,9 +243,8 @@ class FlowNetworkGUI:
         results_header.pack(fill=tk.X, padx=5, pady=5)
         ttk.Label(results_header, text="Results:", font=('Arial', 10, 'bold')).pack(side=tk.LEFT)
         
-        # Scrollable frame for results
+        # Scrollable frame for results (auto-scroll only, no manual scroll)
         results_canvas = tk.Canvas(self.right_panel, highlightthickness=0)
-        results_scrollbar = ttk.Scrollbar(self.right_panel, orient=tk.VERTICAL, command=results_canvas.yview)
         self.results_scroll_frame = ttk.Frame(results_canvas)
         
         self.results_scroll_frame.bind(
@@ -216,14 +253,7 @@ class FlowNetworkGUI:
         )
         
         results_canvas.create_window((0, 0), window=self.results_scroll_frame, anchor="nw")
-        results_canvas.configure(yscrollcommand=results_scrollbar.set)
         
-        # Enable mouse wheel scrolling
-        def on_mousewheel(event):
-            results_canvas.yview_scroll(int(-1*(event.delta/120)), "units")
-        results_canvas.bind_all("<MouseWheel>", on_mousewheel)
-        
-        results_scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
         results_canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=5)
         
         self.main_paned.add(self.right_panel, minsize=20, width=280)
@@ -288,6 +318,8 @@ class FlowNetworkGUI:
             if self.collapsed_sections[section_id]:
                 content_frame.pack_forget()
                 toggle_btn.config(text="▶")
+                # After collapsing, check if we should scroll back to top
+                self.root.after(10, self._auto_scroll_results)
             else:
                 content_frame.pack(fill=tk.X, padx=15)
                 # Clear and repopulate content
@@ -295,11 +327,69 @@ class FlowNetworkGUI:
                     widget.destroy()
                 content_func(content_frame)
                 toggle_btn.config(text="▼")
+                # After expanding, scroll to show the section if needed
+                self.root.after(10, lambda: self._scroll_to_widget(frame))
         
         toggle_btn.config(command=toggle)
         title_label.bind('<Button-1>', lambda e: toggle())
         
         return frame
+    
+    def _scroll_to_widget(self, widget):
+        """Scroll the results canvas to show a widget if it's below the visible area"""
+        self.results_canvas.update_idletasks()
+        
+        # Get canvas visible height
+        canvas_height = self.results_canvas.winfo_height()
+        
+        # Get widget position relative to scroll frame
+        try:
+            widget_y = widget.winfo_y()
+            widget_height = widget.winfo_height()
+            widget_bottom = widget_y + widget_height
+        except:
+            return
+        
+        # Get current scroll position and total content height
+        scroll_region = self.results_canvas.cget('scrollregion')
+        if not scroll_region:
+            return
+        
+        try:
+            _, _, _, total_height = map(int, scroll_region.split())
+        except:
+            return
+        
+        if total_height <= canvas_height:
+            # Content fits, scroll to top
+            self.results_canvas.yview_moveto(0)
+            return
+        
+        # Calculate where to scroll so widget bottom is visible
+        if widget_bottom > canvas_height:
+            # Need to scroll down to show this widget
+            scroll_to = min(widget_bottom - canvas_height + 20, total_height - canvas_height)
+            scroll_fraction = scroll_to / total_height
+            self.results_canvas.yview_moveto(scroll_fraction)
+    
+    def _auto_scroll_results(self):
+        """Auto-scroll results: scroll to top if content fits, otherwise stay"""
+        self.results_canvas.update_idletasks()
+        
+        canvas_height = self.results_canvas.winfo_height()
+        scroll_region = self.results_canvas.cget('scrollregion')
+        
+        if not scroll_region:
+            return
+        
+        try:
+            _, _, _, total_height = map(int, scroll_region.split())
+        except:
+            return
+        
+        if total_height <= canvas_height:
+            # Content fits in view, scroll to top
+            self.results_canvas.yview_moveto(0)
     
     def toggle_left_panel(self):
         """Toggle visibility of left tools panel"""
@@ -309,9 +399,22 @@ class FlowNetworkGUI:
             self.left_visible = False
         else:
             # Re-add at position 0 (leftmost)
-            self.main_paned.add(self.left_panel, before=self.main_paned.panes()[0], minsize=20, width=180)
+            self.main_paned.add(self.left_panel, before=self.main_paned.panes()[0], minsize=20, width=160)
             self.toggle_left_btn.config(text="◀ Tools")
             self.left_visible = True
+    
+    def show_equations_menu(self):
+        """Show dropdown menu for equation options"""
+        menu = tk.Menu(self.root, tearoff=0)
+        menu.add_command(label="Show Equations (Matrix)", command=self.show_equations)
+        menu.add_command(label="Show Symbolic Equations", command=self.show_symbolic_equations)
+        menu.add_command(label="Step-by-Step Guide", command=self.show_step_by_step)
+        
+        # Get button position
+        btn = self.left_panel_content.winfo_children()[-2]  # Equations button
+        x = btn.winfo_rootx()
+        y = btn.winfo_rooty() + btn.winfo_height()
+        menu.post(x, y)
     
     def toggle_right_panel(self):
         """Toggle visibility of right results panel"""
@@ -324,6 +427,78 @@ class FlowNetworkGUI:
             self.main_paned.add(self.right_panel, minsize=20, width=280)
             self.toggle_right_btn.config(text="Results ▶")
             self.right_visible = True
+    
+    def zoom_in(self):
+        """Zoom in on the canvas"""
+        if self.zoom_level < self.max_zoom:
+            self.zoom_level = min(self.max_zoom, self.zoom_level * 1.25)
+            self.update_zoom_label()
+            self.redraw()
+    
+    def zoom_out(self):
+        """Zoom out on the canvas"""
+        if self.zoom_level > self.min_zoom:
+            self.zoom_level = max(self.min_zoom, self.zoom_level / 1.25)
+            self.update_zoom_label()
+            self.redraw()
+    
+    def zoom_reset(self):
+        """Reset zoom to 100%"""
+        self.zoom_level = 1.0
+        self.update_zoom_label()
+        self.redraw()
+    
+    def update_zoom_label(self):
+        """Update the zoom percentage label"""
+        self.zoom_label.config(text=f"{int(self.zoom_level * 100)}%")
+    
+    def on_mouse_wheel(self, event):
+        """Handle mouse wheel for zooming"""
+        if event.delta > 0:
+            self.zoom_in()
+        else:
+            self.zoom_out()
+    
+    def screen_to_canvas(self, x: int, y: int) -> Tuple[int, int]:
+        """Convert screen coordinates to canvas (unzoomed) coordinates"""
+        return int(x / self.zoom_level), int(y / self.zoom_level)
+    
+    def canvas_to_screen(self, x: int, y: int) -> Tuple[int, int]:
+        """Convert canvas (unzoomed) coordinates to screen coordinates"""
+        return int(x * self.zoom_level), int(y * self.zoom_level)
+    
+    def delete_selection(self, event=None):
+        """Delete all selected processes"""
+        if self.selected_processes:
+            self.save_undo_state()
+            for pid in list(self.selected_processes):
+                self.delete_process_internal(pid)
+            self.selected_processes.clear()
+            self.selected_process = None
+            self.redraw()
+            self.status_var.set("Deleted selected processes")
+        elif self.selected_process:
+            self.save_undo_state()
+            self.delete_process_internal(self.selected_process)
+            self.selected_process = None
+            self.redraw()
+            self.status_var.set("Deleted process")
+    
+    def delete_process_internal(self, pid: str):
+        """Internal method to delete a process without undo state"""
+        if pid in self.processes:
+            # Remove associated tubes
+            tubes_to_remove = [tid for tid, tube in self.tubes.items() 
+                             if tube.from_process == pid or tube.to_process == pid]
+            for tid in tubes_to_remove:
+                del self.tubes[tid]
+            # Remove input moles
+            if pid in self.input_moles:
+                del self.input_moles[pid]
+            if pid in self.output_moles:
+                del self.output_moles[pid]
+            # Remove process
+            del self.processes[pid]
         
     def toggle_tube_mode(self):
         """Toggle tube drawing mode"""
@@ -339,7 +514,8 @@ class FlowNetworkGUI:
             
     def on_canvas_click(self, event):
         """Handle canvas click"""
-        x, y = event.x, event.y
+        # Convert screen to canvas coordinates for zoom
+        x, y = self.screen_to_canvas(event.x, event.y)
         
         # Check if clicked on a process
         clicked_process = self.get_process_at(x, y)
@@ -363,17 +539,42 @@ class FlowNetworkGUI:
                     self.status_var.set("Click on source process, then destination process")
                     
         elif clicked_process:
-            self.selected_process = clicked_process
-            self.drag_process = clicked_process
+            # Handle multiple selection with Shift key
+            if event.state & 0x0001:  # Shift key pressed
+                if clicked_process in self.selected_processes:
+                    self.selected_processes.discard(clicked_process)
+                else:
+                    self.selected_processes.add(clicked_process)
+                self.selected_process = clicked_process
+                self.status_var.set(f"Selected {len(self.selected_processes)} processes (Delete to remove)")
+            else:
+                # Clear multi-selection, select single
+                self.selected_processes.clear()
+                self.selected_processes.add(clicked_process)
+                self.selected_process = clicked_process
+                self.drag_process = clicked_process
             self.show_properties(clicked_process)
+            self.redraw()
+        else:
+            # Clicked on empty space - clear selection
+            if not (event.state & 0x0001):  # Unless Shift is held
+                self.selected_processes.clear()
+                self.selected_process = None
+                self.redraw()
             
     def on_right_click(self, event):
         """Handle right click for context menu"""
-        x, y = event.x, event.y
+        x, y = self.screen_to_canvas(event.x, event.y)
         clicked_process = self.get_process_at(x, y)
         clicked_tube = self.get_tube_at(x, y)
         
         menu = tk.Menu(self.root, tearoff=0)
+        
+        # If multiple processes selected, offer to delete all
+        if len(self.selected_processes) > 1 and clicked_process in self.selected_processes:
+            menu.add_command(label=f"Delete {len(self.selected_processes)} selected",
+                           command=self.delete_selection)
+            menu.add_separator()
         
         if clicked_process:
             menu.add_command(label=f"Edit {clicked_process}",
@@ -393,13 +594,116 @@ class FlowNetworkGUI:
         if self.drag_process and not self.drawing_tube:
             proc = self.processes.get(self.drag_process)
             if proc:
-                proc.x = event.x
-                proc.y = event.y
+                x, y = self.screen_to_canvas(event.x, event.y)
+                # Snap to grid if enabled
+                if self.snap_to_grid.get():
+                    x = round(x / self.grid_size) * self.grid_size
+                    y = round(y / self.grid_size) * self.grid_size
+                proc.x = x
+                proc.y = y
                 self.redraw()
                 
     def on_release(self, event):
         """Handle mouse release"""
         self.drag_process = None
+    
+    def on_mouse_move(self, event):
+        """Handle mouse movement for hover tooltips"""
+        x, y = self.screen_to_canvas(event.x, event.y)
+        
+        # Check if hovering over a process
+        proc_id = self.get_process_at(x, y)
+        if proc_id:
+            proc = self.processes[proc_id]
+            self.show_tooltip(event, self.get_process_tooltip(proc))
+            return
+        
+        # Check if hovering over a tube
+        tube_id = self.get_tube_at(x, y)
+        if tube_id:
+            tube = self.tubes[tube_id]
+            self.show_tooltip(event, self.get_tube_tooltip(tube))
+            return
+        
+        # Not hovering over anything - hide tooltip
+        self.hide_tooltip()
+    
+    def get_process_tooltip(self, proc: Process) -> str:
+        """Generate tooltip text for a process"""
+        lines = [f"{proc.name} ({proc.process_type.value.upper()})"]
+        
+        if proc.process_type == ProcessType.REACTOR:
+            if proc.stoich:
+                # Build reaction string
+                reactants = [f"{abs(v):.0f}{self.components.get(k, Component(k,k)).name}" 
+                            for k, v in proc.stoich.items() if v < 0]
+                products = [f"{v:.0f}{self.components.get(k, Component(k,k)).name}" 
+                           for k, v in proc.stoich.items() if v > 0]
+                rxn = " + ".join(reactants) + " → " + " + ".join(products)
+                lines.append(f"Reaction: {rxn}")
+            lines.append(f"α = {proc.conversion:.1%}")
+            
+        elif proc.process_type == ProcessType.INPUT:
+            if proc.id in self.input_moles:
+                lines.append("Input moles:")
+                for cid, moles in self.input_moles[proc.id].items():
+                    cname = self.components.get(cid, Component(cid, cid)).name
+                    lines.append(f"  {cname}: {moles:.4f}")
+                    
+        elif proc.process_type == ProcessType.SEPARATOR:
+            outgoing = [t for t in self.tubes.values() if t.from_process == proc.id]
+            if outgoing and proc.beta_components:
+                lines.append("β values per tube:")
+                for tube in outgoing:
+                    if tube.id in proc.beta_components:
+                        lines.append(f"  {tube.id}: {tube.beta:.3f}")
+        
+        return "\n".join(lines)
+    
+    def get_tube_tooltip(self, tube: Tube) -> str:
+        """Generate tooltip text for a tube"""
+        from_name = self.processes.get(tube.from_process, Process("?", "?", ProcessType.INPUT, 0, 0)).name
+        to_name = self.processes.get(tube.to_process, Process("?", "?", ProcessType.OUTPUT, 0, 0)).name
+        
+        lines = [f"{tube.id}: {from_name} → {to_name}"]
+        lines.append(f"β = {tube.beta:.3f}")
+        
+        if tube.moles:
+            total = tube.total_moles()
+            lines.append(f"Total: {total:.4f} mol")
+            lines.append("Components:")
+            for cid, moles in tube.moles.items():
+                cname = self.components.get(cid, Component(cid, cid)).name
+                lines.append(f"  {cname}: {moles:.4f}")
+        
+        return "\n".join(lines)
+    
+    def show_tooltip(self, event, text: str):
+        """Show tooltip near cursor"""
+        # Hide existing tooltip
+        self.hide_tooltip()
+        
+        # Create new tooltip
+        self.tooltip = tk.Toplevel(self.root)
+        self.tooltip.wm_overrideredirect(True)
+        self.tooltip.wm_geometry(f"+{event.x_root + 15}+{event.y_root + 10}")
+        
+        label = tk.Label(self.tooltip, text=text, justify=tk.LEFT,
+                        background="#ffffe0", relief=tk.SOLID, borderwidth=1,
+                        font=('Consolas', 9))
+        label.pack()
+        
+        # Auto-hide after delay if mouse moves away
+        self.tooltip_id = self.root.after(5000, self.hide_tooltip)
+    
+    def hide_tooltip(self):
+        """Hide the current tooltip"""
+        if self.tooltip:
+            self.tooltip.destroy()
+            self.tooltip = None
+        if self.tooltip_id:
+            self.root.after_cancel(self.tooltip_id)
+            self.tooltip_id = None
         
     def get_process_at(self, x: int, y: int) -> Optional[str]:
         """Get process ID at coordinates"""
@@ -433,14 +737,14 @@ class FlowNetworkGUI:
         dy = y2 - y1
         
         if dx == 0 and dy == 0:
-            return np.sqrt((px - x1)**2 + (py - y1)**2)
+            return math.sqrt((px - x1)**2 + (py - y1)**2)
             
         t = max(0, min(1, ((px - x1)*dx + (py - y1)*dy) / (dx*dx + dy*dy)))
         
         proj_x = x1 + t * dx
         proj_y = y1 + t * dy
         
-        return np.sqrt((px - proj_x)**2 + (py - proj_y)**2)
+        return math.sqrt((px - proj_x)**2 + (py - proj_y)**2)
         
     def create_process(self, x: int, y: int, process_type: ProcessType):
         """Create a new process"""
@@ -676,6 +980,7 @@ class FlowNetworkGUI:
                 'id': v.id, 'from': v.from_process, 'to': v.to_process, 'beta': v.beta
             } for k, v in self.tubes.items()}),
             'input_moles': copy.deepcopy(self.input_moles),
+            'output_moles': copy.deepcopy(self.output_moles),
             'alpha_eff': self.alpha_eff,
             'process_counter': self.process_counter,
             'tube_counter': self.tube_counter,
@@ -718,6 +1023,7 @@ class FlowNetworkGUI:
             )
         
         self.input_moles = state['input_moles']
+        self.output_moles = state.get('output_moles', {})
         self.alpha_eff = state['alpha_eff']
         self.process_counter = state['process_counter']
         self.tube_counter = state['tube_counter']
@@ -733,11 +1039,17 @@ class FlowNetworkGUI:
             del self.processes[pid]
             if pid in self.input_moles:
                 del self.input_moles[pid]
+            if pid in self.output_moles:
+                del self.output_moles[pid]
             # Delete connected tubes
             to_delete = [tid for tid, tube in self.tubes.items() 
                         if tube.from_process == pid or tube.to_process == pid]
             for tid in to_delete:
                 del self.tubes[tid]
+            # Clear from selection
+            self.selected_processes.discard(pid)
+            if self.selected_process == pid:
+                self.selected_process = None
             self.redraw()
             
     def delete_tube(self, tid: str):
@@ -797,7 +1109,7 @@ class FlowNetworkGUI:
         def refresh_list():
             listbox.delete(0, tk.END)
             for cid, comp in self.components.items():
-                listbox.insert(tk.END, cid)  # Just show the name/ID
+                listbox.insert(tk.END, cid)
         
         refresh_list()
         
@@ -812,6 +1124,7 @@ class FlowNetworkGUI:
         name_var = tk.StringVar()
         name_entry = ttk.Entry(inner_frame, textvariable=name_var, width=20)
         name_entry.grid(row=0, column=1, padx=2)
+        
         # Auto-focus on entry
         dialog.after(100, lambda: name_entry.focus_set())
         
@@ -866,6 +1179,13 @@ class FlowNetworkGUI:
         """Redraw the entire canvas"""
         self.canvas.delete("all")
         
+        # Apply zoom scale
+        z = self.zoom_level
+        
+        # Draw grid if snap to grid is enabled
+        if self.snap_to_grid.get():
+            self.draw_grid()
+        
         # Draw tubes first (behind processes)
         for tid, tube in self.tubes.items():
             self.draw_tube(tube)
@@ -873,10 +1193,29 @@ class FlowNetworkGUI:
         # Draw processes
         for pid, proc in self.processes.items():
             self.draw_process(proc)
+    
+    def draw_grid(self):
+        """Draw grid lines on the canvas"""
+        width = self.canvas.winfo_width()
+        height = self.canvas.winfo_height()
+        z = self.zoom_level
+        grid_scaled = int(self.grid_size * z)
+        
+        if grid_scaled < 5:  # Don't draw grid if too small
+            return
+        
+        # Draw vertical lines
+        for x in range(0, width, grid_scaled):
+            self.canvas.create_line(x, 0, x, height, fill='#e0e0e0', tags='grid')
+        
+        # Draw horizontal lines
+        for y in range(0, height, grid_scaled):
+            self.canvas.create_line(0, y, width, y, fill='#e0e0e0', tags='grid')
             
     def draw_process(self, proc: Process):
         """Draw a process on the canvas with auto-sizing based on content"""
-        x, y = proc.x, proc.y
+        z = self.zoom_level
+        x, y = int(proc.x * z), int(proc.y * z)
         
         color = PROCESS_COLORS.get(proc.process_type, "#FFFFFF")
         
@@ -901,24 +1240,41 @@ class FlowNetworkGUI:
         # Height: taller if showing reaction
         h = 70 if rxn_str else 50
         
-        # Update process dimensions for hit detection
+        # Update process dimensions for hit detection (unzoomed)
         proc.width = w
         proc.height = h
         
+        # Scale for display
+        w_scaled = int(w * z)
+        h_scaled = int(h * z)
+        
+        # Calculate font sizes based on zoom
+        name_font_size = max(6, int(9 * z))
+        small_font_size = max(5, int(8 * z))
+        
+        # Draw selection box if selected
+        is_selected = proc.id in self.selected_processes or proc.id == self.selected_process
+        if is_selected:
+            # Draw selection highlight (thicker, colored border)
+            self.canvas.create_rectangle(x - w_scaled//2 - 3, y - h_scaled//2 - 3, 
+                                        x + w_scaled//2 + 3, y + h_scaled//2 + 3,
+                                        outline="#0078D7", width=3, dash=(5, 2))
+        
         # Draw rectangle
-        self.canvas.create_rectangle(x - w//2, y - h//2, x + w//2, y + h//2,
+        self.canvas.create_rectangle(x - w_scaled//2, y - h_scaled//2, x + w_scaled//2, y + h_scaled//2,
                                     fill=color, outline="black", width=2)
         
         # Draw name
-        self.canvas.create_text(x, y - 10 if rxn_str else y, text=proc.name, font=('Arial', 9, 'bold'))
+        self.canvas.create_text(x, y - int(10*z) if rxn_str else y, text=proc.name, 
+                               font=('Arial', name_font_size, 'bold'))
         
         # Draw stoichiometry for reactors (full string, no truncation)
         if rxn_str:
-            self.canvas.create_text(x, y + 12, text=rxn_str, font=('Arial', 8))
+            self.canvas.create_text(x, y + int(12*z), text=rxn_str, font=('Arial', small_font_size))
         
         # Draw ID
-        self.canvas.create_text(x - w//2 + 15, y - h//2 + 10, text=proc.id, 
-                               font=('Arial', 8), fill="gray")
+        self.canvas.create_text(x - w_scaled//2 + int(15*z), y - h_scaled//2 + int(10*z), text=proc.id, 
+                               font=('Arial', small_font_size), fill="gray")
                                
     def draw_tube(self, tube: Tube):
         """Draw a tube (arrow) on the canvas with smart routing"""
@@ -928,35 +1284,38 @@ class FlowNetworkGUI:
         if not from_proc or not to_proc:
             return
         
-        # Get the route points for this tube
+        z = self.zoom_level
+        
+        # Get the route points for this tube (in canvas coordinates)
         points = self.calculate_tube_route(tube, from_proc, to_proc)
         
+        # Scale points for zoom
+        scaled_points = [(int(x * z), int(y * z)) for x, y in points]
+        
         tube_color = "blue"
+        line_width = max(1, int(2 * z))
+        font_size = max(5, int(8 * z))
         
         # Draw the polyline with arrow at the end
-        if len(points) >= 2:
+        if len(scaled_points) >= 2:
             # Draw line segments
-            for i in range(len(points) - 1):
-                x1, y1 = points[i]
-                x2, y2 = points[i + 1]
-                is_last = (i == len(points) - 2)
+            for i in range(len(scaled_points) - 1):
+                x1, y1 = scaled_points[i]
+                x2, y2 = scaled_points[i + 1]
+                is_last = (i == len(scaled_points) - 2)
                 self.canvas.create_line(x1, y1, x2, y2, 
                                         arrow=tk.LAST if is_last else None, 
-                                        width=2, fill=tube_color)
+                                        width=line_width, fill=tube_color)
             
             # Draw label at midpoint of route
-            mid_idx = len(points) // 2
-            if len(points) % 2 == 0:
-                mx = (points[mid_idx-1][0] + points[mid_idx][0]) / 2
-                my = (points[mid_idx-1][1] + points[mid_idx][1]) / 2
+            mid_idx = len(scaled_points) // 2
+            if len(scaled_points) % 2 == 0:
+                mx = (scaled_points[mid_idx-1][0] + scaled_points[mid_idx][0]) / 2
+                my = (scaled_points[mid_idx-1][1] + scaled_points[mid_idx][1]) / 2
             else:
-                mx, my = points[mid_idx]
+                mx, my = scaled_points[mid_idx]
             
-            label = f"{tube.id}\nβ={tube.beta:.2f}"
-            if tube.moles:
-                total = tube.total_moles()
-                label += f"\n{total:.2f} mol"
-            self.canvas.create_text(mx, my - 15, text=label, font=('Arial', 8), fill=tube_color)
+            self.canvas.create_text(mx, my - int(15*z), text=tube.id, font=('Arial', font_size), fill=tube_color)
     
     def calculate_tube_route(self, tube: Tube, from_proc: Process, to_proc: Process) -> List[Tuple[int, int]]:
         """Calculate the route points for a tube, avoiding other processes"""
@@ -1169,78 +1528,44 @@ class FlowNetworkGUI:
             messagebox.showwarning("Warning", "Please define components first using 'Manage Components'!", parent=self.root)
             return
         
-        # Validate separator betas sum to 1 (only when alpha_eff is NOT specified)
+        # Validate separator betas (only when alpha_eff is NOT specified)
         if self.alpha_eff == 0:
-            warnings = []
-            for proc in self.processes.values():
-                if proc.process_type == ProcessType.SEPARATOR:
-                    outgoing = [t for t in self.tubes.values() if t.from_process == proc.id]
-                    if len(outgoing) > 1:
-                        for comp_id in self.components.keys():
-                            beta_sum = 0.0
-                            for tube in outgoing:
-                                if tube.id in proc.beta_components:
-                                    beta_sum += proc.beta_components[tube.id].get(comp_id, tube.beta)
-                                else:
-                                    beta_sum += tube.beta
-                            if abs(beta_sum - 1.0) > 0.01:
-                                warnings.append(f"  {proc.name}: β sum for {comp_id} = {beta_sum:.2f} (should be 1.0)")
-        
-            if warnings:
-                msg = "WARNING: Separator betas don't sum to 1.0!\\nThis will cause mass imbalance:\\n" + "\\n".join(warnings)
-                if not messagebox.askyesno("Beta Warning", msg + "\\n\\nContinue anyway?", parent=self.root):
+            beta_warnings = validate_separator_betas(self.processes, self.tubes, self.components)
+            if beta_warnings:
+                msg = "WARNING: Separator betas don't sum to 1.0!\nThis will cause mass imbalance:\n" + "\n".join(beta_warnings)
+                if not messagebox.askyesno("Beta Warning", msg + "\n\nContinue anyway?", parent=self.root):
                     return
             
         try:
-            A, b, variables = self.build_equation_system()
+            # Call calculation module
+            results, warnings = calc_solve_network(
+                self.components,
+                self.processes,
+                self.tubes,
+                self.input_moles,
+                self.alpha_eff
+            )
             
-            if len(A) == 0:
+            if not results:
                 messagebox.showwarning("Warning", "No equations to solve!", parent=self.root)
                 return
-                
-            n_equations, n_variables = A.shape
             
-            # Remove redundant equations
-            A_reduced, b_reduced = self._remove_redundant_equations(A, b)
-            
-            # Solve
-            if len(A_reduced) == n_variables:
-                try:
-                    solution = np.linalg.solve(A_reduced, b_reduced)
-                except np.linalg.LinAlgError:
-                    solution, _, _, _ = np.linalg.lstsq(A_reduced, b_reduced, rcond=None)
-            else:
-                solution, _, _, _ = np.linalg.lstsq(A_reduced, b_reduced, rcond=None)
-            
-            # Check for negative mole values and warn user
-            negative_vars = []
-            for i, var in enumerate(variables):
-                if var[0] == 'tube' and solution[i] < -1e-6:
-                    negative_vars.append((var[1], var[2], solution[i]))
-            
-            if negative_vars:
-                # This indicates the system may be under-constrained or physically impossible
-                msg = "Warning: Some intermediate flows have negative values:\\n"
-                for tid, cid, val in negative_vars[:5]:  # Show first 5
-                    msg += f"  {tid} {cid}: {val:.4f}\\n"
-                if len(negative_vars) > 5:
-                    msg += f"  ... and {len(negative_vars) - 5} more\\n"
-                msg += "\\nThis may indicate:\\n"
-                msg += "- The system is under-constrained (more unknowns than equations)\\n"
-                msg += "- The α_eff target may not be physically achievable\\n"
+            # Show warnings if any
+            if warnings:
+                msg = "\n".join(warnings)
+                msg += "\n\nThis may indicate:\n"
+                msg += "- The system is under-constrained\n"
+                msg += "- The α_eff target may not be physically achievable\n"
                 msg += "- The per-pass conversion α may be too low for the target α_eff"
                 messagebox.showwarning("Negative Flows", msg, parent=self.root)
             
-            # Clear old results
+            # Clear old results and store new ones
             for tube in self.tubes.values():
                 tube.moles = {}
-                
-            # Store results (no multiplication - alpha_eff is handled in equations)
-            for i, var in enumerate(variables):
-                var_type = var[0]
-                if var_type == 'tube':
-                    _, tube_id, comp_id = var
-                    self.tubes[tube_id].moles[comp_id] = solution[i]
+            
+            for tube_id, comp_moles in results.items():
+                for comp_id, moles in comp_moles.items():
+                    self.tubes[tube_id].moles[comp_id] = moles
                 
             # Display results
             self.display_results()
@@ -1249,350 +1574,165 @@ class FlowNetworkGUI:
             
         except Exception as e:
             import traceback
-            messagebox.showerror("Error", f"Failed to solve: {str(e)}\\n{traceback.format_exc()}", parent=self.root)
+            messagebox.showerror("Error", f"Failed to solve: {str(e)}\n{traceback.format_exc()}", parent=self.root)
     
-    def _remove_redundant_equations(self, A: np.ndarray, b: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
-        """Remove linearly dependent equations"""
-        if len(A) == 0:
-            return A, b
-        Q, R = np.linalg.qr(A.T)
-        independent = np.abs(np.diag(R)) > 1e-10
-        independent_indices = []
-        rank = 0
-        for i in range(len(A)):
-            if rank < len(independent) and independent[rank]:
-                independent_indices.append(i)
-            rank += 1
-            if rank >= len(independent):
-                break
-        if len(independent_indices) < len(A):
-            return A[independent_indices], b[independent_indices]
-        return A, b
+    def reverse_solve(self):
+        """Reverse calculation: specify desired output, solve for required input"""
+        if not self.processes or not self.tubes:
+            messagebox.showwarning("Warning", "Please create a network first!", parent=self.root)
+            return
+        
+        if not self.components:
+            messagebox.showwarning("Warning", "Please define components first!", parent=self.root)
+            return
+        
+        # Find input and output processes
+        input_procs = [p for p in self.processes.values() if p.process_type == ProcessType.INPUT]
+        output_procs = [p for p in self.processes.values() if p.process_type == ProcessType.OUTPUT]
+        
+        if not input_procs:
+            messagebox.showwarning("Warning", "Need at least one INPUT process!", parent=self.root)
+            return
+        if not output_procs:
+            messagebox.showwarning("Warning", "Need at least one OUTPUT process!", parent=self.root)
+            return
+        
+        # Create dialog to specify target outputs
+        dialog = tk.Toplevel(self.root)
+        dialog.title("Reverse Solve - Specify Target Output")
+        dialog.geometry("450x400")
+        dialog.transient(self.root)
+        
+        ttk.Label(dialog, text="Specify desired OUTPUT amounts:", 
+                 font=('Arial', 11, 'bold')).pack(pady=10)
+        ttk.Label(dialog, text="(Enter target moles for output streams)", 
+                 font=('Arial', 9)).pack()
+        
+        # Scrollable frame for outputs
+        canvas = tk.Canvas(dialog, height=250)
+        scrollbar = ttk.Scrollbar(dialog, orient="vertical", command=canvas.yview)
+        scroll_frame = ttk.Frame(canvas)
+        
+        scroll_frame.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
+        canvas.create_window((0, 0), window=scroll_frame, anchor="nw")
+        canvas.configure(yscrollcommand=scrollbar.set)
+        
+        canvas.pack(side="left", fill="both", expand=True, padx=10)
+        scrollbar.pack(side="right", fill="y")
+        
+        # Create entry fields for each output process and component
+        target_vars = {}  # (process_id, comp_id) -> DoubleVar
+        
+        row = 0
+        for out_proc in output_procs:
+            ttk.Label(scroll_frame, text=f"{out_proc.name}:", 
+                     font=('Arial', 10, 'bold')).grid(row=row, column=0, columnspan=2, sticky='w', pady=(10,2))
+            row += 1
             
-    def build_equation_system(self, use_current_betas=True) -> Tuple[np.ndarray, np.ndarray, List]:
-        """
-        Build the system of linear equations for moles of each component in each tube.
-        
-        For reactors with stoichiometry aA + bB -> cC + dD and conversion α:
-        - Find the limiting reactant (the one with least moles relative to stoichiometry)
-        - Express all consumption/production in terms of the limiting reactant consumed
-        - For component C: n_out[C] = n_in[C] + (stoich[C]/stoich[lim]) * α * n_in[lim]
-        
-        Parameters:
-            use_current_betas: If True, use current beta values. If False, uses variable beta tubes'
-                               solved_beta if available, otherwise their beta value.
-        """
-        component_ids = list(self.components.keys())
-        tube_ids = list(self.tubes.keys())
-        
-        # Variables: moles of each component in each tube (no extent variables)
-        variables = []
-        for tid in tube_ids:
-            for cid in component_ids:
-                variables.append(('tube', tid, cid))
-        
-        n_vars = len(variables)
-        var_index = {v: i for i, v in enumerate(variables)}
-        
-        equations = []
-        
-        for proc_id, process in self.processes.items():
-            incoming = [t for t in self.tubes.values() if t.to_process == proc_id]
-            outgoing = [t for t in self.tubes.values() if t.from_process == proc_id]
-            
-            if process.process_type == ProcessType.INPUT:
-                # Input: outgoing moles = input moles for each component
-                for comp_id in component_ids:
-                    input_mol = self.input_moles.get(proc_id, {}).get(comp_id, 0.0)
-                    if input_mol > 0 or outgoing:
-                        coeffs = np.zeros(n_vars)
-                        for tube in outgoing:
-                            coeffs[var_index[('tube', tube.id, comp_id)]] = 1.0
-                        equations.append((coeffs, input_mol))
-                        
-            elif process.process_type == ProcessType.REACTOR:
-                # Reactor with stoichiometry
-                # α = fraction of reference reactant converted
-                # n_out[C] = n_in[C] + stoich[C] × α × n_in[ref] / |stoich[ref]|
-                # Since stoich[ref] is negative, this correctly handles signs
-                conversion = process.conversion
+            for cid, comp in self.components.items():
+                ttk.Label(scroll_frame, text=f"  {comp.name}:").grid(row=row, column=0, sticky='e', padx=5)
                 
-                # Find the reference reactant: choose the one with smallest |stoich|
-                # E.g., for 3H2 + N2 -> 2NH3, choose N2 (|stoich|=1)
-                reference_reactant = None
-                reference_stoich = None
-                for cid, coeff in process.stoich.items():
-                    if coeff < 0:  # This is a reactant
-                        if reference_stoich is None or abs(coeff) < abs(reference_stoich):
-                            reference_reactant = cid
-                            reference_stoich = coeff  # Negative value
+                # Default to current output_moles if set, else 0
+                current = self.output_moles.get(out_proc.id, {}).get(cid, 0.0)
+                var = tk.DoubleVar(value=current)
+                target_vars[(out_proc.id, cid)] = var
                 
-                for comp_id in component_ids:
-                    stoich_coeff = process.stoich.get(comp_id, 0.0)
-                    
-                    if outgoing and reference_reactant is not None:
-                        coeffs = np.zeros(n_vars)
-                        
-                        # Extent of reaction: ξ = α × n_in[ref] / |stoich[ref]|
-                        # Change for component C: Δn[C] = stoich[C] × ξ
-                        # So: n_out[C] = n_in[C] + stoich[C] × α × n_in[ref] / |stoich[ref]|
-                        #
-                        # For ref (stoich=-1): n_out = n_in + (-1) × α × n_in / 1 = n_in × (1-α) ✓
-                        # For H2 (stoich=-3): n_out = n_in[H2] + (-3) × α × n_in[N2] / 1 = n_in[H2] - 3α×n_in[N2] ✓
-                        # For NH3 (stoich=+2): n_out = n_in[NH3] + 2 × α × n_in[N2] / 1 = n_in[NH3] + 2α×n_in[N2] ✓
-                        
-                        # n_out[C]
-                        for tube in outgoing:
-                            coeffs[var_index[('tube', tube.id, comp_id)]] = 1.0
-                        
-                        # - n_in[C]
-                        for tube in incoming:
-                            coeffs[var_index[('tube', tube.id, comp_id)]] = -1.0
-                        
-                        # - stoich[C] × α / |stoich[ref]| × n_in[ref]
-                        if stoich_coeff != 0 and reference_stoich is not None:
-                            factor = stoich_coeff * conversion / abs(reference_stoich)
-                            for tube in incoming:
-                                coeffs[var_index[('tube', tube.id, reference_reactant)]] -= factor
-                        
-                        equations.append((coeffs, 0.0))
-                        
-            elif process.process_type == ProcessType.MIXER:
-                # Mixer: output = sum of inputs for each component (mass balance)
-                for comp_id in component_ids:
-                    if outgoing:
-                        coeffs = np.zeros(n_vars)
-                        for tube in outgoing:
-                            coeffs[var_index[('tube', tube.id, comp_id)]] = 1.0
-                        for tube in incoming:
-                            coeffs[var_index[('tube', tube.id, comp_id)]] = -1.0
-                        equations.append((coeffs, 0.0))
-                        
-            elif process.process_type == ProcessType.SEPARATOR:
-                # Separator: physical split where all components split with the SAME β
-                if self.alpha_eff > 0:
-                    # Find reference reactant and stoichiometry
-                    ref_reactant = None
-                    ref_stoich = None
-                    all_stoich = {}
-                    for proc in self.processes.values():
-                        if proc.process_type == ProcessType.REACTOR:
-                            for cid, coeff in proc.stoich.items():
-                                all_stoich[cid] = coeff
-                                if coeff < 0:
-                                    if ref_stoich is None or abs(coeff) < abs(ref_stoich):
-                                        ref_reactant = cid
-                                        ref_stoich = coeff
-                    
-                    # Get original input values for ratio calculation
-                    input_procs = [p for p in self.processes.values() if p.process_type == ProcessType.INPUT]
-                    total_input = {}
-                    for comp_id in component_ids:
-                        total_input[comp_id] = sum(
-                            self.input_moles.get(p.id, {}).get(comp_id, 0.0) for p in input_procs
-                        )
-                    ref_input = total_input.get(ref_reactant, 0.0)
-                    
-                    # Mass balance for reference component
-                    if ref_reactant:
-                        coeffs = np.zeros(n_vars)
-                        for tube in outgoing:
-                            coeffs[var_index[('tube', tube.id, ref_reactant)]] = 1.0
-                        for in_tube in incoming:
-                            coeffs[var_index[('tube', in_tube.id, ref_reactant)]] = -1.0
-                        equations.append((coeffs, 0.0))
-                    
-                    # For each output tube, constrain component ratios
-                    # The key insight: purge[C]/purge[ref] ratio is KNOWN from alpha_eff
-                    # And recycle[C]/recycle[ref] must be the SAME ratio (physical splitter)
-                    # 
-                    # For reactants: ratio = input[C]/input[ref] (stoichiometric feed ratio)
-                    # For products: ratio = (stoich[C] * α_eff) / ((1-α_eff) * |stoich[ref]|)
-                    #               from purge[prod] = stoich * α_eff * input[ref] / |stoich[ref]|
-                    #               and  purge[ref] = input[ref] * (1-α_eff)
-                    
-                    for tube in outgoing:
-                        for comp_id in component_ids:
-                            if comp_id != ref_reactant and ref_stoich is not None:
-                                stoich_c = all_stoich.get(comp_id, 0.0)
-                                
-                                if stoich_c < 0:
-                                    # Reactant: calculate based on stoichiometry
-                                    # out[C] = input[C] - |stoich[C]|/|stoich[ref]| * α_eff * input[ref]
-                                    # out[ref] = input[ref] * (1 - α_eff)
-                                    # ratio = out[C] / out[ref]
-                                    input_c = total_input.get(comp_id, 0.0)
-                                    consumed_c = abs(stoich_c) / abs(ref_stoich) * self.alpha_eff * ref_input
-                                    out_c = input_c - consumed_c
-                                    out_ref = ref_input * (1 - self.alpha_eff)
-                                    if out_ref > 0:
-                                        ratio = out_c / out_ref
-                                    else:
-                                        ratio = 0.0
-                                elif stoich_c > 0:
-                                    # Product: ratio from alpha_eff relationship
-                                    # purge[C] = stoich[C] * α_eff * input[ref] / |stoich[ref]|
-                                    # purge[ref] = input[ref] * (1 - α_eff)
-                                    # ratio = purge[C] / purge[ref] = stoich[C] * α_eff / (|stoich[ref]| * (1-α_eff))
-                                    ratio = stoich_c * self.alpha_eff / (abs(ref_stoich) * (1 - self.alpha_eff))
-                                else:
-                                    # Inert: ratio from input
-                                    if ref_input > 0:
-                                        ratio = total_input.get(comp_id, 0.0) / ref_input
-                                    else:
-                                        ratio = 0.0
-                                
-                                # Constraint: out[C] = ratio * out[ref]
-                                coeffs = np.zeros(n_vars)
-                                coeffs[var_index[('tube', tube.id, comp_id)]] = 1.0
-                                coeffs[var_index[('tube', tube.id, ref_reactant)]] = -ratio
-                                equations.append((coeffs, 0.0))
-                else:
-                    # No alpha_eff: use beta values to determine split
-                    # Key insight: when two components have the SAME beta in a tube,
-                    # their output ratio equals their FEED ratio (physical splitter preserves ratios)
-                    
-                    # Get feed ratios from INPUT processes
-                    input_procs = [p for p in self.processes.values() if p.process_type == ProcessType.INPUT]
-                    total_feed = {}
-                    for comp_id in component_ids:
-                        total_feed[comp_id] = sum(
-                            self.input_moles.get(inp.id, {}).get(comp_id, 0.0) for inp in input_procs
-                        )
-                    
-                    # First: mass balance for each component (sum of outputs = sum of inputs)
-                    for comp_id in component_ids:
-                        coeffs = np.zeros(n_vars)
-                        for tube in outgoing:
-                            coeffs[var_index[('tube', tube.id, comp_id)]] = 1.0
-                        for in_tube in incoming:
-                            coeffs[var_index[('tube', in_tube.id, comp_id)]] = -1.0
-                        equations.append((coeffs, 0.0))
-                    
-                    # Second: for each tube, get component betas and add constraints
-                    for tube in outgoing:
-                        # Get beta for each component
-                        comp_betas = {}
-                        for comp_id in component_ids:
-                            if tube.id in process.beta_components:
-                                comp_betas[comp_id] = process.beta_components[tube.id].get(comp_id, 0.0)
-                            else:
-                                comp_betas[comp_id] = tube.beta
-                        
-                        # Group components by their beta value
-                        beta_groups = {}
-                        for comp_id, beta_c in comp_betas.items():
-                            if beta_c not in beta_groups:
-                                beta_groups[beta_c] = []
-                            beta_groups[beta_c].append(comp_id)
-                        
-                        # For each beta group with beta > 0
-                        for beta_c, comps in beta_groups.items():
-                            if beta_c > 0 and len(comps) >= 1:
-                                # Pick reference component (prefer one with feed > 0)
-                                ref_comp = comps[0]
-                                for c in comps:
-                                    if total_feed.get(c, 0) > 0:
-                                        ref_comp = c
-                                        break
-                                
-                                ref_feed = total_feed.get(ref_comp, 0.0)
-                                
-                                # Add constraint: out[ref] = beta * in[ref]
-                                coeffs = np.zeros(n_vars)
-                                coeffs[var_index[('tube', tube.id, ref_comp)]] = 1.0
-                                for in_tube in incoming:
-                                    coeffs[var_index[('tube', in_tube.id, ref_comp)]] = -beta_c
-                                equations.append((coeffs, 0.0))
-                                
-                                # For other components in same beta group:
-                                # Use FEED ratio to constrain output ratio
-                                # out[C] / out[ref] = feed[C] / feed[ref]
-                                # Linear form: out[C] = out[ref] * (feed[C] / feed[ref])
-                                for comp_id in comps:
-                                    if comp_id != ref_comp:
-                                        comp_feed = total_feed.get(comp_id, 0.0)
-                                        if ref_feed > 0:
-                                            ratio = comp_feed / ref_feed
-                                        else:
-                                            ratio = 0.0
-                                        
-                                        # out[C] - ratio * out[ref] = 0
-                                        coeffs = np.zeros(n_vars)
-                                        coeffs[var_index[('tube', tube.id, comp_id)]] = 1.0
-                                        coeffs[var_index[('tube', tube.id, ref_comp)]] = -ratio
-                                        equations.append((coeffs, 0.0))
-                        
-            elif process.process_type == ProcessType.OUTPUT:
-                # Output: just receives flow, no equations needed
-                pass
+                ttk.Entry(scroll_frame, textvariable=var, width=12).grid(row=row, column=1, padx=5, pady=2)
+                row += 1
         
-        # Add alpha_eff constraint if enabled (> 0)
-        if self.alpha_eff > 0:
-            # Find input and output processes
-            input_procs = [p for p in self.processes.values() if p.process_type == ProcessType.INPUT]
-            output_procs = [p for p in self.processes.values() if p.process_type == ProcessType.OUTPUT]
+        def do_reverse_solve():
+            # Save target outputs
+            self.output_moles.clear()
+            for (pid, cid), var in target_vars.items():
+                if pid not in self.output_moles:
+                    self.output_moles[pid] = {}
+                self.output_moles[pid][cid] = var.get()
             
-            # Find the reference reactant (smallest |stoich| among reactants)
-            # and collect stoichiometry
-            reference_reactant = None
-            reference_stoich = None
-            all_stoich = {}
-            for proc in self.processes.values():
-                if proc.process_type == ProcessType.REACTOR:
-                    for cid, coeff in proc.stoich.items():
-                        all_stoich[cid] = coeff
-                        if coeff < 0:  # Reactant
-                            if reference_stoich is None or abs(coeff) < abs(reference_stoich):
-                                reference_reactant = cid
-                                reference_stoich = coeff
+            # Check if any target is specified
+            total_target = sum(sum(comps.values()) for comps in self.output_moles.values())
+            if total_target <= 0:
+                messagebox.showwarning("Warning", "Please specify at least one non-zero target output!", parent=dialog)
+                return
             
-            if input_procs and output_procs and reference_reactant:
-                # Get input moles for ALL components
-                total_input = {}
-                for comp_id in component_ids:
-                    total_input[comp_id] = sum(
-                        self.input_moles.get(inp.id, {}).get(comp_id, 0.0) for inp in input_procs
-                    )
-                
-                ref_total = total_input.get(reference_reactant, 0.0)
-                
-                if ref_total > 0:
-                    # For each component, constrain the output based on alpha_eff
-                    for comp_id in component_ids:
-                        stoich_c = all_stoich.get(comp_id, 0.0)
-                        input_c = total_input.get(comp_id, 0.0)
-                        
-                        coeffs = np.zeros(n_vars)
-                        for out_proc in output_procs:
-                            incoming_to_output = [t for t in self.tubes.values() if t.to_process == out_proc.id]
-                            for tube in incoming_to_output:
-                                coeffs[var_index[('tube', tube.id, comp_id)]] = 1.0
-                        
-                        if stoich_c < 0:
-                            # Reactant: output = input - consumed
-                            # consumed = |stoich[C]| / |stoich[ref]| * α_eff * input[ref]
-                            consumed = abs(stoich_c) / abs(reference_stoich) * self.alpha_eff * ref_total
-                            rhs = input_c - consumed
-                        elif stoich_c > 0:
-                            # Product: output = input + produced
-                            # produced = ref_consumed * (stoich_product / |stoich_ref|)
-                            # ref_consumed = ref_input * α_eff
-                            produced = ref_total * self.alpha_eff * stoich_c / abs(reference_stoich)
-                            rhs = input_c + produced
-                        else:
-                            # Inert (stoich = 0): output = input (no conversion)
-                            rhs = input_c
-                        
-                        equations.append((coeffs, rhs))
-                    
-        if not equations:
-            return np.array([]), np.array([]), variables
-            
-        A = np.array([eq[0] for eq in equations])
-        b = np.array([eq[1] for eq in equations])
+            dialog.destroy()
+            self._perform_reverse_solve()
         
-        return A, b, variables
+        btn_frame = ttk.Frame(dialog)
+        btn_frame.pack(pady=10)
+        ttk.Button(btn_frame, text="Solve", command=do_reverse_solve).pack(side=tk.LEFT, padx=5)
+        ttk.Button(btn_frame, text="Cancel", command=dialog.destroy).pack(side=tk.LEFT, padx=5)
+    
+    def _perform_reverse_solve(self):
+        """Execute the reverse solve calculation"""
+        try:
+            # Get target output from output_moles
+            target_output = {}
+            for pid, comps in self.output_moles.items():
+                for cid, moles in comps.items():
+                    target_output[cid] = target_output.get(cid, 0) + moles
+            
+            # Call calculation module
+            results, required_input, scale_factor, stoich_ratios, warnings = calc_reverse_solve(
+                self.components,
+                self.processes,
+                self.tubes,
+                target_output,
+                self.alpha_eff
+            )
+            
+            # Show warnings
+            for warning in warnings:
+                if "negative" in warning.lower() or "infeasible" in warning.lower():
+                    messagebox.showwarning("Warning", warning, parent=self.root)
+                elif "scale factors vary" in warning.lower() or "don't match" in warning.lower():
+                    # Detailed scale factor mismatch
+                    msg = "Target ratios don't match expected output ratios.\n\n"
+                    msg += f"Using average scale: {scale_factor:.4f}"
+                    messagebox.showwarning("Ratio Mismatch", msg, parent=self.root)
+            
+            if not results or not required_input:
+                messagebox.showwarning("Warning", "Could not solve network!", parent=self.root)
+                return
+            
+            # Store results in tubes
+            for tube in self.tubes.values():
+                tube.moles = {}
+            
+            for tube_id, comp_moles in results.items():
+                for comp_id, moles in comp_moles.items():
+                    self.tubes[tube_id].moles[comp_id] = moles
+            
+            # Update input_moles with calculated required input
+            self.input_moles = required_input
+            
+            # Display results
+            self.display_results()
+            self.redraw()
+            
+            # Show required input in a message
+            msg = "REQUIRED INPUT (calculated):\n\n"
+            for pid, comps in required_input.items():
+                proc = self.processes[pid]
+                msg += f"{proc.name}:\n"
+                for cid, moles in comps.items():
+                    if moles > 1e-9:  # Only show non-zero inputs
+                        comp = self.components[cid]
+                        msg += f"  {comp.name}: {moles:.4f} mol\n"
+            
+            msg += f"\nScale factor used: {scale_factor:.4f}"
+            
+            # Show stoichiometric ratios used
+            msg += "\n\nStoichiometric input ratios:"
+            for cid, ratio in stoich_ratios.items():
+                if ratio > 0:
+                    msg += f"\n  {self.components[cid].name}: {ratio:.2f}"
+            
+            messagebox.showinfo("Reverse Solve Complete", msg, parent=self.root)
+            self.status_var.set("Reverse solve complete - input updated")
+            
+        except Exception as e:
+            import traceback
+            messagebox.showerror("Error", f"Reverse solve failed: {str(e)}\n{traceback.format_exc()}", parent=self.root)
         
     def display_results(self):
         """Display moles of each component using collapsible sections"""
@@ -1674,9 +1814,9 @@ class FlowNetworkGUI:
                         
                         if t.moles:
                             for comp_id, moles in t.moles.items():
-                                comp_name = self.components.get(comp_id, Component(comp_id, comp_id)).name
+                                comp = self.components.get(comp_id, Component(comp_id, comp_id))
                                 display_moles = abs(moles) if abs(moles) < 1e-9 else moles
-                                ttk.Label(parent, text=f"{comp_name}: {display_moles:.4f} mol").pack(anchor='w')
+                                ttk.Label(parent, text=f"{comp.name}: {display_moles:.4f} mol").pack(anchor='w')
                             
                             ttk.Separator(parent, orient=tk.HORIZONTAL).pack(fill=tk.X, pady=2)
                             ttk.Label(parent, text=f"TOTAL: {total_val:.4f} mol", 
@@ -1691,9 +1831,88 @@ class FlowNetworkGUI:
                     initially_open=False
                 )
         
+        # Mass Balance Summary section
+        self.add_mass_balance_summary()
+        
         # Update scroll region
         self.results_scroll_frame.update_idletasks()
         self.results_canvas.configure(scrollregion=self.results_canvas.bbox("all"))
+    
+    def add_mass_balance_summary(self):
+        """Add mass balance summary to results panel"""
+        # Find input and output tubes
+        input_procs = [p.id for p in self.processes.values() if p.process_type == ProcessType.INPUT]
+        output_procs = [p.id for p in self.processes.values() if p.process_type == ProcessType.OUTPUT]
+        
+        input_tubes = [t for t in self.tubes.values() if t.from_process in input_procs]
+        output_tubes = [t for t in self.tubes.values() if t.to_process in output_procs]
+        
+        if not input_tubes and not output_tubes:
+            return
+        
+        # Calculate totals per component
+        input_totals = {}
+        output_totals = {}
+        
+        for comp_id in self.components:
+            input_totals[comp_id] = sum(t.moles.get(comp_id, 0) for t in input_tubes if t.moles)
+            output_totals[comp_id] = sum(t.moles.get(comp_id, 0) for t in output_tubes if t.moles)
+        
+        # Check if any results exist
+        if all(v == 0 for v in input_totals.values()) and all(v == 0 for v in output_totals.values()):
+            return
+        
+        ttk.Separator(self.results_scroll_frame, orient=tk.HORIZONTAL).pack(fill=tk.X, pady=5)
+        
+        def mass_balance_content(parent):
+            # Header
+            header_frame = ttk.Frame(parent)
+            header_frame.pack(fill=tk.X, pady=(0, 5))
+            ttk.Label(header_frame, text="Component", font=('Arial', 8, 'bold'), width=12).pack(side=tk.LEFT)
+            ttk.Label(header_frame, text="Input", font=('Arial', 8, 'bold'), width=10).pack(side=tk.LEFT)
+            ttk.Label(header_frame, text="Output", font=('Arial', 8, 'bold'), width=10).pack(side=tk.LEFT)
+            ttk.Label(header_frame, text="Δ (Out-In)", font=('Arial', 8, 'bold'), width=10).pack(side=tk.LEFT)
+            
+            # Data rows
+            total_in = 0
+            total_out = 0
+            for comp_id, comp in self.components.items():
+                inp = input_totals.get(comp_id, 0)
+                out = output_totals.get(comp_id, 0)
+                delta = out - inp
+                total_in += inp
+                total_out += out
+                
+                row_frame = ttk.Frame(parent)
+                row_frame.pack(fill=tk.X)
+                ttk.Label(row_frame, text=comp.name, width=12).pack(side=tk.LEFT)
+                ttk.Label(row_frame, text=f"{inp:.4f}", width=10).pack(side=tk.LEFT)
+                ttk.Label(row_frame, text=f"{out:.4f}", width=10).pack(side=tk.LEFT)
+                
+                # Color code delta - red if significantly different (not conserved), green if close to zero
+                delta_label = ttk.Label(row_frame, text=f"{delta:+.4f}", width=10)
+                delta_label.pack(side=tk.LEFT)
+            
+            # Total row
+            ttk.Separator(parent, orient=tk.HORIZONTAL).pack(fill=tk.X, pady=2)
+            total_frame = ttk.Frame(parent)
+            total_frame.pack(fill=tk.X)
+            ttk.Label(total_frame, text="TOTAL", font=('Arial', 8, 'bold'), width=12).pack(side=tk.LEFT)
+            ttk.Label(total_frame, text=f"{total_in:.4f}", font=('Arial', 8, 'bold'), width=10).pack(side=tk.LEFT)
+            ttk.Label(total_frame, text=f"{total_out:.4f}", font=('Arial', 8, 'bold'), width=10).pack(side=tk.LEFT)
+            ttk.Label(total_frame, text=f"{total_out - total_in:+.4f}", font=('Arial', 8, 'bold'), width=10).pack(side=tk.LEFT)
+            
+            # Note about conservation
+            ttk.Label(parent, text="Note: Δ ≠ 0 indicates reaction consumption/production",
+                     font=('Arial', 7, 'italic'), foreground='gray').pack(anchor='w', pady=(5, 0))
+        
+        self.create_collapsible_section(
+            self.results_scroll_frame,
+            "MASS BALANCE SUMMARY",
+            mass_balance_content,
+            "mass_balance",
+            initially_open=True  # Show expanded by default
+        )
             
     def show_symbolic_equations(self):
         """Show only the symbolic equations used to solve the system"""
@@ -1818,6 +2037,177 @@ class FlowNetworkGUI:
         
         text.insert(tk.END, "\n" + "="*60 + "\n")
         text.insert(tk.END, f"Total equations: {eq_num - 1}\n")
+    
+    def show_step_by_step(self):
+        """Show step-by-step explanation of how equations are built"""
+        if not self.processes:
+            messagebox.showinfo("Info", "Create a network first", parent=self.root)
+            return
+        
+        # Create new window
+        window = tk.Toplevel(self.root)
+        window.title("Step-by-Step Equation Guide")
+        window.geometry("800x600")
+        window.transient(self.root)
+        
+        text = tk.Text(window, font=('Consolas', 10), wrap=tk.WORD)
+        scrollbar = ttk.Scrollbar(window, orient='vertical', command=text.yview)
+        text.configure(yscrollcommand=scrollbar.set)
+        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        text.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+        
+        # Configure tags for formatting
+        text.tag_configure('title', font=('Arial', 14, 'bold'), foreground='#2E86AB')
+        text.tag_configure('section', font=('Arial', 11, 'bold'), foreground='#A23B72')
+        text.tag_configure('process', font=('Arial', 10, 'bold'), foreground='#1B4332')
+        text.tag_configure('equation', font=('Consolas', 10), foreground='#000080')
+        text.tag_configure('explain', font=('Arial', 9), foreground='#555555')
+        
+        # Header
+        text.insert(tk.END, "STEP-BY-STEP EQUATION BUILDING GUIDE\n", 'title')
+        text.insert(tk.END, "="*60 + "\n\n")
+        
+        # Overview
+        text.insert(tk.END, "OVERVIEW\n", 'section')
+        text.insert(tk.END, f"Components: {', '.join([c.name for c in self.components.values()])}\n")
+        text.insert(tk.END, f"Processes: {len(self.processes)}, Tubes: {len(self.tubes)}\n")
+        if self.alpha_eff > 0:
+            text.insert(tk.END, f"α_eff (overall conversion): {self.alpha_eff:.4f} ({self.alpha_eff*100:.1f}%)\n", 'explain')
+        else:
+            text.insert(tk.END, "α_eff: disabled (using manual β values)\n", 'explain')
+        text.insert(tk.END, "\n")
+        
+        # Find reference reactant
+        reference_reactant = None
+        reference_stoich = None
+        all_stoich = {}
+        for proc in self.processes.values():
+            if proc.process_type == ProcessType.REACTOR:
+                for cid, coeff in proc.stoich.items():
+                    all_stoich[cid] = coeff
+                    if coeff < 0 and (reference_stoich is None or abs(coeff) < abs(reference_stoich)):
+                        reference_reactant = cid
+                        reference_stoich = coeff
+        
+        if reference_reactant:
+            ref_name = self.components.get(reference_reactant, Component(reference_reactant, reference_reactant)).name
+            text.insert(tk.END, f"Reference reactant: {ref_name} (|ν| = {abs(reference_stoich)})\n", 'explain')
+        text.insert(tk.END, "\n" + "-"*60 + "\n\n")
+        
+        component_ids = list(self.components.keys())
+        step_num = 1
+        
+        for pid, process in self.processes.items():
+            incoming = [t for t in self.tubes.values() if t.to_process == pid]
+            outgoing = [t for t in self.tubes.values() if t.from_process == pid]
+            
+            text.insert(tk.END, f"\n{process.name} ({process.process_type.value.upper()})\n", 'process')
+            
+            if process.process_type == ProcessType.INPUT:
+                text.insert(tk.END, "  Input nodes set known feed compositions.\n", 'explain')
+                for tube in outgoing:
+                    text.insert(tk.END, f"  Step {step_num}: For each component, output = feed amount\n", 'explain')
+                    for cid in component_ids:
+                        cname = self.components.get(cid, Component(cid, cid)).name
+                        feed = self.input_moles.get(pid, {}).get(cid, 0)
+                        text.insert(tk.END, f"    n({cname},{tube.id}) = {feed:.4f}\n", 'equation')
+                    step_num += 1
+                    
+            elif process.process_type == ProcessType.MIXER:
+                text.insert(tk.END, "  Mixers combine all incoming streams (mass balance).\n", 'explain')
+                text.insert(tk.END, f"  Step {step_num}: Sum of outputs = Sum of inputs (per component)\n", 'explain')
+                for cid in component_ids:
+                    cname = self.components.get(cid, Component(cid, cid)).name
+                    out_str = " + ".join([f"n({cname},{t.id})" for t in outgoing])
+                    in_str = " + ".join([f"n({cname},{t.id})" for t in incoming]) if incoming else "0"
+                    text.insert(tk.END, f"    {out_str} = {in_str}\n", 'equation')
+                step_num += 1
+                    
+            elif process.process_type == ProcessType.REACTOR:
+                text.insert(tk.END, f"  Reactor with conversion α = {process.conversion:.1%}\n", 'explain')
+                
+                # Find local reference
+                local_ref = None
+                local_ref_stoich = None
+                for cid, coeff in process.stoich.items():
+                    if coeff < 0 and (local_ref_stoich is None or abs(coeff) < abs(local_ref_stoich)):
+                        local_ref = cid
+                        local_ref_stoich = coeff
+                
+                if local_ref:
+                    ref_name = self.components.get(local_ref, Component(local_ref, local_ref)).name
+                    text.insert(tk.END, f"  Reference: {ref_name} (limiting reactant, |ν| = {abs(local_ref_stoich)})\n", 'explain')
+                    text.insert(tk.END, f"  Step {step_num}: Apply stoichiometry relative to reference\n", 'explain')
+                    
+                    for cid in component_ids:
+                        cname = self.components.get(cid, Component(cid, cid)).name
+                        stoich_c = process.stoich.get(cid, 0.0)
+                        
+                        out_str = " + ".join([f"n({cname},{t.id})" for t in outgoing])
+                        in_str = " + ".join([f"n({cname},{t.id})" for t in incoming]) if incoming else "0"
+                        ref_in = " + ".join([f"n({ref_name},{t.id})" for t in incoming]) if incoming else "0"
+                        
+                        if stoich_c < 0:
+                            ratio = abs(stoich_c) / abs(local_ref_stoich)
+                            text.insert(tk.END, f"    {out_str} = {in_str} - {ratio:.2f}·α·({ref_in})\n", 'equation')
+                            text.insert(tk.END, f"      ↳ Reactant consumed: (|ν_{cname}|/|ν_{ref_name}|)·α·n_in\n", 'explain')
+                        elif stoich_c > 0:
+                            ratio = stoich_c / abs(local_ref_stoich)
+                            text.insert(tk.END, f"    {out_str} = {in_str} + {ratio:.2f}·α·({ref_in})\n", 'equation')
+                            text.insert(tk.END, f"      ↳ Product formed: (ν_{cname}/|ν_{ref_name}|)·α·n_in\n", 'explain')
+                        else:
+                            text.insert(tk.END, f"    {out_str} = {in_str}\n", 'equation')
+                            text.insert(tk.END, f"      ↳ Inert: passes through unchanged\n", 'explain')
+                    step_num += 1
+                    
+            elif process.process_type == ProcessType.SEPARATOR:
+                if self.alpha_eff > 0 and reference_reactant:
+                    text.insert(tk.END, "  Separator splits governed by α_eff constraint.\n", 'explain')
+                    text.insert(tk.END, "  The system calculates splits to achieve target conversion.\n", 'explain')
+                    ref_name = self.components.get(reference_reactant, Component(reference_reactant, reference_reactant)).name
+                    
+                    text.insert(tk.END, f"  Step {step_num}: Mass balance for reference reactant\n", 'explain')
+                    out_str = " + ".join([f"n({ref_name},{t.id})" for t in outgoing])
+                    in_str = " + ".join([f"n({ref_name},{t.id})" for t in incoming]) if incoming else "0"
+                    text.insert(tk.END, f"    {out_str} = {in_str}\n", 'equation')
+                    step_num += 1
+                    
+                    text.insert(tk.END, f"  Step {step_num}: Ratio constraints from α_eff\n", 'explain')
+                    for tube in outgoing:
+                        for cid in component_ids:
+                            if cid != reference_reactant:
+                                cname = self.components.get(cid, Component(cid, cid)).name
+                                stoich_c = all_stoich.get(cid, 0.0)
+                                text.insert(tk.END, f"    n({cname},{tube.id}) = ratio({cname})·n({ref_name},{tube.id})\n", 'equation')
+                    step_num += 1
+                else:
+                    text.insert(tk.END, "  Separator uses manual β (split fraction) values.\n", 'explain')
+                    text.insert(tk.END, f"  Step {step_num}: Mass balance per component\n", 'explain')
+                    for cid in component_ids:
+                        cname = self.components.get(cid, Component(cid, cid)).name
+                        out_str = " + ".join([f"n({cname},{t.id})" for t in outgoing])
+                        in_str = " + ".join([f"n({cname},{t.id})" for t in incoming]) if incoming else "0"
+                        text.insert(tk.END, f"    {out_str} = {in_str}\n", 'equation')
+                    step_num += 1
+                    
+                    text.insert(tk.END, f"  Step {step_num}: Split fractions\n", 'explain')
+                    for tube in outgoing:
+                        text.insert(tk.END, f"    Tube {tube.id}: β = {tube.beta:.4f}\n", 'explain')
+                        for cid in component_ids:
+                            cname = self.components.get(cid, Component(cid, cid)).name
+                            beta_c = process.beta_components.get(cid, tube.beta)
+                            in_str = " + ".join([f"n({cname},{t.id})" for t in incoming]) if incoming else "0"
+                            text.insert(tk.END, f"      n({cname},{tube.id}) = {beta_c:.4f}·({in_str})\n", 'equation')
+                    step_num += 1
+                    
+            elif process.process_type == ProcessType.OUTPUT:
+                text.insert(tk.END, "  Output: endpoint of flow network.\n", 'explain')
+                text.insert(tk.END, f"  Step {step_num}: (No equations - flow terminates here)\n", 'explain')
+                step_num += 1
+        
+        text.insert(tk.END, "\n" + "="*60 + "\n")
+        text.insert(tk.END, f"Total steps: {step_num - 1}\n", 'section')
+        text.insert(tk.END, "\nClick 'Solve Network' to compute actual values.\n", 'explain')
             
     def show_equations(self):
         """Show the system of equations in readable, descriptive format"""
@@ -1948,11 +2338,16 @@ class FlowNetworkGUI:
                         ref_in_str = " + ".join([f"n({ref_name},{t.id})" for t in incoming])
                         
                         if stoich_c != 0:
-                            factor = stoich_c * process.conversion / abs(local_ref_stoich)
-                            if factor > 0:
-                                text.insert(tk.END, f"  ({eq_num}) {out_str} = {in_str} + {factor:.4g} × {ref_in_str}\n")
+                            coeff = abs(stoich_c) / abs(local_ref_stoich)
+                            alpha = process.conversion
+                            if coeff == 1.0:
+                                coeff_str = f"{alpha:.4g}"
                             else:
-                                text.insert(tk.END, f"  ({eq_num}) {out_str} = {in_str} - {abs(factor):.4g} × {ref_in_str}\n")
+                                coeff_str = f"{coeff:.4g} × {alpha:.4g}"
+                            if stoich_c > 0:
+                                text.insert(tk.END, f"  ({eq_num}) {out_str} = {in_str} + {coeff_str} × {ref_in_str}\n")
+                            else:
+                                text.insert(tk.END, f"  ({eq_num}) {out_str} = {in_str} - {coeff_str} × {ref_in_str}\n")
                         else:
                             text.insert(tk.END, f"  ({eq_num}) {out_str} = {in_str}  (inert)\n")
                         eq_num += 1
@@ -2072,6 +2467,9 @@ class FlowNetworkGUI:
             self.processes.clear()
             self.tubes.clear()
             self.input_moles.clear()
+            self.output_moles.clear()
+            self.selected_processes.clear()
+            self.selected_process = None
             self.alpha_eff = 0.0
             self.process_counter = 0
             self.tube_counter = 0
@@ -2105,6 +2503,7 @@ class FlowNetworkGUI:
                     "id": t.id, "from": t.from_process, "to": t.to_process, "beta": t.beta
                 } for tid, t in self.tubes.items()},
                 "input_moles": self.input_moles,
+                "output_moles": self.output_moles,
                 "alpha_eff": self.alpha_eff
             }
             
@@ -2112,6 +2511,75 @@ class FlowNetworkGUI:
                 json.dump(data, f, indent=2)
                 
             self.status_var.set(f"Saved to {filename}")
+    
+    def export_results_csv(self):
+        """Export calculation results to CSV file"""
+        from tkinter import filedialog
+        import csv
+        
+        # Check if there are results to export
+        has_results = any(tube.moles for tube in self.tubes.values())
+        if not has_results:
+            messagebox.showwarning("Warning", "No results to export. Please solve the network first!", parent=self.root)
+            return
+        
+        filename = filedialog.asksaveasfilename(
+            parent=self.root,
+            defaultextension=".csv",
+            filetypes=[("CSV files", "*.csv"), ("All files", "*.*")]
+        )
+        
+        if not filename:
+            return
+        
+        try:
+            with open(filename, 'w', newline='', encoding='utf-8') as f:
+                writer = csv.writer(f)
+                
+                # Header row with component names
+                comp_names = [self.components[cid].name for cid in sorted(self.components.keys())]
+                writer.writerow(['Tube ID', 'From', 'To', 'Beta'] + comp_names + ['Total Moles'])
+                
+                # Data rows for each tube
+                for tid in sorted(self.tubes.keys()):
+                    tube = self.tubes[tid]
+                    from_proc = self.processes.get(tube.from_process)
+                    to_proc = self.processes.get(tube.to_process)
+                    from_name = from_proc.name if from_proc else tube.from_process
+                    to_name = to_proc.name if to_proc else tube.to_process
+                    
+                    # Get moles for each component
+                    moles_row = []
+                    total = 0
+                    for cid in sorted(self.components.keys()):
+                        m = tube.moles.get(cid, 0)
+                        moles_row.append(f"{m:.6f}")
+                        total += m
+                    
+                    writer.writerow([tid, from_name, to_name, f"{tube.beta:.4f}"] + moles_row + [f"{total:.6f}"])
+                
+                # Empty row before summary
+                writer.writerow([])
+                
+                # Summary section - Reactors
+                writer.writerow(['=== REACTORS ==='])
+                for pid, proc in self.processes.items():
+                    if proc.process_type == ProcessType.REACTOR:
+                        writer.writerow([proc.name, f"Conversion: {proc.conversion:.1%}"])
+                        if proc.stoich:
+                            stoich_str = ', '.join([f"{k}:{v:+.0f}" for k, v in proc.stoich.items()])
+                            writer.writerow(['', f"Stoichiometry: {stoich_str}"])
+                
+                # Summary section - Alpha eff
+                if self.alpha_eff > 0:
+                    writer.writerow([])
+                    writer.writerow(['=== OVERALL CONVERSION ==='])
+                    writer.writerow([f"Alpha_eff: {self.alpha_eff:.4f} ({self.alpha_eff*100:.1f}%)"])
+                
+            self.status_var.set(f"Results exported to {filename}")
+            
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to export: {str(e)}", parent=self.root)
             
     def load_network(self):
         """Load network from JSON file"""
@@ -2130,6 +2598,8 @@ class FlowNetworkGUI:
             self.processes.clear()
             self.tubes.clear()
             self.input_moles.clear()
+            self.selected_processes.clear()
+            self.selected_process = None
             
             # Load components
             for cid, cdata in data.get("components", {}).items():
@@ -2156,6 +2626,7 @@ class FlowNetworkGUI:
                 )
             
             self.input_moles = data.get("input_moles", {})
+            self.output_moles = data.get("output_moles", {})
             self.alpha_eff = data.get("alpha_eff", 0.0)  # Default to disabled
             
             # Update counters based on loaded data
@@ -2173,6 +2644,9 @@ class FlowNetworkGUI:
         self.processes.clear()
         self.tubes.clear()
         self.input_moles.clear()
+        self.output_moles.clear()
+        self.selected_processes.clear()
+        self.selected_process = None
         
         # Define components
         self.components = {
